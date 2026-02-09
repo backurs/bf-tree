@@ -386,6 +386,10 @@ impl BfTree {
         })
     }
 
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
     /// Get the buffer metrics of the circular buffer.
     /// This is a blocking call, will stop all other buffer operations,
     /// use it wisely.

@@ -325,6 +325,10 @@ impl Config {
         self.cb_max_record_size
     }
 
+    pub fn get_cb_size_byte(&self) -> usize {
+        self.cb_size_byte
+    }
+
     pub fn leaf_page_size(&mut self, leaf_page_size: usize) -> &mut Self {
         self.leaf_page_size = leaf_page_size;
         self
