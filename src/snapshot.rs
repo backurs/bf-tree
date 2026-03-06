@@ -25,6 +25,7 @@ use crate::{
         leaf_node::{LeafNode, OpType},
         InnerNode, InnerNodeBuilder, PageID, DISK_PAGE_SIZE, INNER_NODE_SIZE,
     },
+    range_scan::ScanReturnField,
     storage::{make_vfs, LeafStorage, PageLocation, PageTable},
     sync::atomic::AtomicU64,
     tree::eviction_callback,
@@ -296,23 +297,14 @@ impl BfTree {
         self.config.file_path.clone()
     }
 
-    /// Extract live (non-deleted) key-value pairs from a `LeafStats` into the records vector.
-    fn collect_live_records(stats: &LeafStats, records: &mut Vec<(Vec<u8>, Vec<u8>)>) {
-        for (i, key) in stats.keys.iter().enumerate() {
-            match stats.op_types[i] {
-                OpType::Insert | OpType::Cache => {
-                    records.push((key.clone(), stats.values[i].clone()));
-                }
-                OpType::Delete | OpType::Phantom => {}
-            }
-        }
-    }
-
     /// Snapshot an in-memory Bf-Tree to a file on disk.
     ///
-    /// This works by reading all live records out of the in-memory tree,
-    /// inserting them into a new file-backed tree with compatible configuration,
-    /// and calling [`snapshot`] on that tree.
+    /// This works by scanning all live records from the in-memory tree and inserting
+    /// them one-by-one into a new file-backed tree, then calling [`snapshot`] on it.
+    /// Records are streamed without buffering the entire dataset in memory.
+    ///
+    /// For `cache_only` trees (where scan is not supported), falls back to collecting
+    /// records via BFS traversal before inserting.
     ///
     /// Returns the snapshot file path.
     ///
@@ -326,71 +318,97 @@ impl BfTree {
             snapshot_path
         );
 
-        // Step 1: Collect all live key-value pairs from the in-memory tree.
-        let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        // Build a disk-backed config from the current config.
+        let mut disk_config = self.config.as_ref().clone();
+        disk_config.storage_backend(StorageBackend::Std);
+        disk_config.cache_only(false);
+        disk_config.file_path(snapshot_path);
 
-        let visitor = BfsVisitor::new_all_nodes(self);
+        let disk_tree = BfTree::with_config(disk_config, None)
+            .expect("Failed to create disk-backed BfTree for snapshot");
+
+        if self.cache_only {
+            // cache_only mode does not support scan, so fall back to BFS traversal.
+            Self::copy_records_via_traversal(self, &disk_tree);
+        } else {
+            // Use the scan operator to stream records directly into the disk tree
+            // without buffering the entire dataset in memory.
+            Self::copy_records_via_scan(self, &disk_tree);
+        }
+
+        disk_tree.snapshot()
+    }
+
+    /// Copy all live records from `src` to `dst` using the scan operator.
+    /// This streams one record at a time, avoiding large intermediate allocations.
+    fn copy_records_via_scan(src: &BfTree, dst: &BfTree) {
+        // Allocate a single reusable buffer large enough for any key+value.
+        let buf_size = src.config.leaf_page_size;
+        let mut scan_buf = vec![0u8; buf_size];
+
+        // Start scanning from the smallest possible key (a single 0x00 byte).
+        let start_key: &[u8] = &[0u8];
+        let mut scan_iter =
+            match src.scan_with_count(start_key, usize::MAX, ScanReturnField::KeyAndValue) {
+                Ok(iter) => iter,
+                Err(_) => return, // empty tree or other issue
+            };
+
+        while let Some((key_len, value_len)) = scan_iter.next(&mut scan_buf) {
+            let key = &scan_buf[..key_len];
+            let value = &scan_buf[key_len..key_len + value_len];
+            dst.insert(key, value);
+        }
+    }
+
+    /// Copy all live records from `src` to `dst` by traversing leaf nodes directly.
+    /// Used as a fallback when scan is not available (e.g. cache_only mode).
+    fn copy_records_via_traversal(src: &BfTree, dst: &BfTree) {
+        let visitor = BfsVisitor::new_all_nodes(src);
         for node_info in visitor {
             match node_info {
                 NodeInfo::Leaf { page_id, .. } => {
-                    let mut leaf_entry = self.mapping_table().get_mut(&page_id);
+                    let mut leaf_entry = src.mapping_table().get_mut(&page_id);
                     let page_loc = leaf_entry.get_page_location().clone();
                     match page_loc {
-                        PageLocation::Mini(ptr) if self.cache_only => {
-                            // In cache_only mode, mini pages have no backing base page
-                            // (next_level is null), so read directly from the pointer.
+                        PageLocation::Mini(ptr) if src.cache_only => {
                             let leaf_node: &LeafNode = unsafe { &*ptr };
                             for kv_meta in leaf_node.meta_iter() {
-                                let op = kv_meta.op_type();
-                                match op {
+                                match kv_meta.op_type() {
                                     OpType::Insert | OpType::Cache => {
                                         let key = leaf_node.get_full_key(kv_meta);
-                                        let value = leaf_node.get_value(kv_meta).to_vec();
-                                        records.push((key, value));
+                                        let value = leaf_node.get_value(kv_meta);
+                                        dst.insert(&key, value);
                                     }
                                     OpType::Delete | OpType::Phantom => {}
                                 }
                             }
                         }
                         PageLocation::Mini(_) | PageLocation::Full(_) | PageLocation::Base(_) => {
-                            // Use get_stats() which correctly handles all three variants:
-                            //   Mini (non-cache_only): reads both the mini page overlay and
-                            //       the underlying base page.
-                            //   Full: reads the full page in the circular buffer.
-                            //   Base: reads from disk/MemoryVfs.
                             let stats = leaf_entry.get_stats();
-                            Self::collect_live_records(&stats, &mut records);
+                            Self::insert_live_records(&stats, dst);
                             if let Some(base_stats) = &stats.base_node {
-                                Self::collect_live_records(base_stats, &mut records);
+                                Self::insert_live_records(base_stats, dst);
                             }
                         }
-                        PageLocation::Null => {
-                            // Evicted page in cache_only mode, nothing to read
-                        }
+                        PageLocation::Null => {}
                     }
                 }
-                NodeInfo::Inner { .. } => {
-                    // Inner nodes are not data-bearing; skip.
-                }
+                NodeInfo::Inner { .. } => {}
             }
         }
+    }
 
-        // Step 2: Build a disk-backed config from the current config.
-        let mut disk_config = self.config.as_ref().clone();
-        disk_config.storage_backend(StorageBackend::Std);
-        disk_config.cache_only(false);
-        disk_config.file_path(snapshot_path);
-
-        // Step 3: Create a new disk-backed tree and insert all records.
-        let disk_tree = BfTree::with_config(disk_config, None)
-            .expect("Failed to create disk-backed BfTree for snapshot");
-
-        for (key, value) in &records {
-            disk_tree.insert(key, value);
+    /// Insert live (non-deleted) records from `LeafStats` directly into a target tree.
+    fn insert_live_records(stats: &LeafStats, dst: &BfTree) {
+        for (i, key) in stats.keys.iter().enumerate() {
+            match stats.op_types[i] {
+                OpType::Insert | OpType::Cache => {
+                    dst.insert(key, &stats.values[i]);
+                }
+                OpType::Delete | OpType::Phantom => {}
+            }
         }
-
-        // Step 4: Snapshot the disk-backed tree.
-        disk_tree.snapshot()
     }
 
     /// Load an on-disk Bf-Tree snapshot and return a new in-memory (cache_only) Bf-Tree
@@ -425,26 +443,7 @@ impl BfTree {
 
         let disk_tree = BfTree::new_from_snapshot(disk_config, None)?;
 
-        // Step 2: Collect all live key-value pairs from the disk-backed tree.
-        let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-
-        let visitor = BfsVisitor::new_all_nodes(&disk_tree);
-        for node_info in visitor {
-            match node_info {
-                NodeInfo::Leaf { page_id, .. } => {
-                    let mut leaf_entry = disk_tree.mapping_table().get_mut(&page_id);
-                    let stats = leaf_entry.get_stats();
-                    Self::collect_live_records(&stats, &mut records);
-                    if let Some(base_stats) = &stats.base_node {
-                        Self::collect_live_records(base_stats, &mut records);
-                    }
-                }
-                NodeInfo::Inner { .. } => {}
-            }
-        }
-        drop(disk_tree);
-
-        // Step 3: Create the in-memory tree.
+        // Step 2: Create the in-memory tree.
         // Use Memory backend with cache_only=false so that evicted pages
         // are stored as heap-backed base pages (no data loss).
         let mut mem_config = memory_config;
@@ -453,10 +452,9 @@ impl BfTree {
 
         let mem_tree = BfTree::with_config(mem_config, None)?;
 
-        // Step 4: Insert all records into the in-memory tree.
-        for (key, value) in &records {
-            mem_tree.insert(key, value);
-        }
+        // Step 3: Stream records from the disk tree into the memory tree via scan.
+        // The disk tree is never cache_only, so scan is always available.
+        Self::copy_records_via_scan(&disk_tree, &mem_tree);
 
         Ok(mem_tree)
     }
@@ -621,7 +619,7 @@ mod tests {
         let max_record_size: usize = 2048;
         let leaf_page_size: usize = 8192;
 
-        // Create a cache-only (in-memory) BfTree
+        // Create an in-memory (non-cache_only) BfTree
         let mut config = Config::new(":memory:", leaf_page_size * 16);
         config.cb_min_record_size = min_record_size;
         config.cb_max_record_size = max_record_size;
@@ -640,6 +638,67 @@ mod tests {
         }
 
         // Snapshot the in-memory tree to disk
+        let path = bftree.snapshot_memory_to_disk(&snapshot_path);
+        assert_eq!(path, snapshot_path);
+        assert!(snapshot_path.exists());
+        drop(bftree);
+
+        // Reload the snapshot into a disk-backed tree and verify all records
+        let mut disk_config = Config::new(&snapshot_path, leaf_page_size * 16);
+        disk_config.storage_backend(crate::StorageBackend::Std);
+        disk_config.cb_min_record_size = min_record_size;
+        disk_config.cb_max_record_size = max_record_size;
+        disk_config.leaf_page_size = leaf_page_size;
+        disk_config.max_fence_len = max_record_size;
+
+        let loaded = BfTree::new_from_snapshot(disk_config, None).unwrap();
+        let mut out_buffer = vec![0u8; key_len];
+        for r in 0..record_cnt {
+            let key = install_value_to_buffer(&mut key_buffer, r);
+            let result = loaded.read(key, &mut out_buffer);
+            match result {
+                LeafReadResult::Found(v) => {
+                    assert_eq!(v as usize, key_len);
+                    assert_eq!(&out_buffer[..key_len], key);
+                }
+                other => {
+                    panic!("Key {r} not found, got: {:?}", other);
+                }
+            }
+        }
+
+        std::fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_memory_to_disk_roundtrip_cache_only() {
+        let snapshot_path =
+            std::path::PathBuf::from_str("target/test_cache_to_disk.bftree").unwrap();
+        let _ = std::fs::remove_file(&snapshot_path);
+
+        let min_record_size: usize = 64;
+        let max_record_size: usize = 2048;
+        let leaf_page_size: usize = 8192;
+
+        // Create a cache-only BfTree
+        let mut config = Config::new(":cache:", leaf_page_size * 16);
+        config.cb_min_record_size = min_record_size;
+        config.cb_max_record_size = max_record_size;
+        config.leaf_page_size = leaf_page_size;
+        config.max_fence_len = max_record_size;
+
+        let bftree = BfTree::with_config(config.clone(), None).unwrap();
+
+        let key_len: usize = min_record_size / 2;
+        let record_cnt = 200;
+        let mut key_buffer = vec![0usize; key_len / 8];
+
+        for r in 0..record_cnt {
+            let key = install_value_to_buffer(&mut key_buffer, r);
+            bftree.insert(key, key);
+        }
+
+        // Snapshot the cache-only tree to disk
         let path = bftree.snapshot_memory_to_disk(&snapshot_path);
         assert_eq!(path, snapshot_path);
         assert!(snapshot_path.exists());
