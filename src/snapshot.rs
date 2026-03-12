@@ -458,6 +458,55 @@ impl BfTree {
 
         Ok(mem_tree)
     }
+
+    /// Load an on-disk Bf-Tree snapshot and return a new cache-only Bf-Tree
+    /// containing all its records.
+    ///
+    /// Unlike [`new_from_snapshot_disk_to_memory`], this creates a `cache_only` tree
+    /// where evicted pages are permanently lost. The circular buffer must be large
+    /// enough to hold all records; otherwise data will be silently dropped.
+    ///
+    /// The caller provides a `Config` that controls the cache tree's parameters
+    /// (circular buffer size, record sizes, leaf page size, etc.).
+    /// `storage_backend` and `cache_only` are overridden automatically.
+    ///
+    /// # Arguments
+    /// * `snapshot_path` – path to an existing snapshot file on disk.
+    /// * `cache_config` – configuration for the resulting cache-only tree.
+    ///
+    /// # Panics
+    /// Panics if the snapshot file does not exist.
+    pub fn new_from_snapshot_disk_to_cache(
+        snapshot_path: impl AsRef<Path>,
+        cache_config: Config,
+    ) -> Result<Self, ConfigError> {
+        let snapshot_path = snapshot_path.as_ref();
+        assert!(
+            snapshot_path.exists(),
+            "new_from_snapshot_disk_to_cache: snapshot file does not exist: {:?}",
+            snapshot_path
+        );
+
+        // Step 1: Open the on-disk snapshot as a normal disk-backed tree.
+        let mut disk_config = cache_config.clone();
+        disk_config.storage_backend(StorageBackend::Std);
+        disk_config.cache_only(false);
+        disk_config.file_path(snapshot_path);
+
+        let disk_tree = BfTree::new_from_snapshot(disk_config, None)?;
+
+        // Step 2: Create the cache-only tree.
+        let mut cache_cfg = cache_config;
+        cache_cfg.storage_backend(StorageBackend::Memory);
+        cache_cfg.cache_only(true);
+
+        let cache_tree = BfTree::with_config(cache_cfg, None)?;
+
+        // Step 3: Stream records from the disk tree into the cache tree via scan.
+        Self::copy_records_via_scan(&disk_tree, &cache_tree);
+
+        Ok(cache_tree)
+    }
 }
 
 /// We use repr(C) for simplicity, maybe flatbuffer or bincode or even repr(Rust) is better.
@@ -778,6 +827,68 @@ mod tests {
         for r in 0..record_cnt {
             let key = install_value_to_buffer(&mut key_buffer, r);
             let result = mem_tree.read(key, &mut out_buffer);
+            match result {
+                LeafReadResult::Found(v) => {
+                    assert_eq!(v as usize, key_len);
+                    assert_eq!(&out_buffer[..key_len], key);
+                }
+                other => {
+                    panic!("Key {r} not found, got: {:?}", other);
+                }
+            }
+        }
+
+        std::fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_disk_to_cache_roundtrip() {
+        let snapshot_path =
+            std::path::PathBuf::from_str("target/test_disk_to_cache.bftree").unwrap();
+        let _ = std::fs::remove_file(&snapshot_path);
+
+        let min_record_size: usize = 64;
+        let max_record_size: usize = 2048;
+        let leaf_page_size: usize = 8192;
+        let record_cnt: usize = 200;
+
+        // Step 1: Build a disk-backed tree, populate it, snapshot to disk.
+        {
+            let mut config = Config::new(&snapshot_path, leaf_page_size * 16);
+            config.storage_backend(crate::StorageBackend::Std);
+            config.cb_min_record_size = min_record_size;
+            config.cb_max_record_size = max_record_size;
+            config.leaf_page_size = leaf_page_size;
+            config.max_fence_len = max_record_size;
+
+            let tree = BfTree::with_config(config, None).unwrap();
+            let key_len = min_record_size / 2;
+            let mut key_buffer = vec![0usize; key_len / 8];
+
+            for r in 0..record_cnt {
+                let key = install_value_to_buffer(&mut key_buffer, r);
+                tree.insert(key, key);
+            }
+            tree.snapshot();
+        }
+
+        // Step 2: Load the snapshot into a cache-only tree.
+        let mut cache_config = Config::new(":cache:", leaf_page_size * 16);
+        cache_config.cb_min_record_size = min_record_size;
+        cache_config.cb_max_record_size = max_record_size;
+        cache_config.leaf_page_size = leaf_page_size;
+        cache_config.max_fence_len = max_record_size;
+
+        let cache_tree =
+            BfTree::new_from_snapshot_disk_to_cache(&snapshot_path, cache_config).unwrap();
+
+        // Step 3: Verify all records are present.
+        let key_len = min_record_size / 2;
+        let mut key_buffer = vec![0usize; key_len / 8];
+        let mut out_buffer = vec![0u8; key_len];
+        for r in 0..record_cnt {
+            let key = install_value_to_buffer(&mut key_buffer, r);
+            let result = cache_tree.read(key, &mut out_buffer);
             match result {
                 LeafReadResult::Found(v) => {
                     assert_eq!(v as usize, key_len);
